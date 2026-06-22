@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import html as _html
 import re
 from datetime import datetime, timezone
@@ -6960,11 +6961,26 @@ class TelegramAdapter(BasePlatformAdapter):
             ack_text = "🍽️ Refeição"
 
         logger.info("[NWE_CALLBACK_BEFORE_ANSWER] data=%s chat_id=%s message_id=%s", data, chat_id, message_id)
+        ack_started = time.perf_counter()
         try:
-            await query.answer(text=ack_text)
-            logger.info("[NWE_CALLBACK_AFTER_ANSWER] data=%s chat_id=%s message_id=%s", data, chat_id, message_id)
+            await asyncio.wait_for(query.answer(text=ack_text), timeout=3.0)
+            logger.info(
+                "[NWE_CALLBACK_AFTER_ANSWER] data=%s chat_id=%s message_id=%s elapsed_ms=%s",
+                data,
+                chat_id,
+                message_id,
+                int((time.perf_counter() - ack_started) * 1000),
+            )
         except Exception as exc:
-            logger.warning("[TG_ANSWER_CALLBACK_ERROR] data=%s error=%s", data, exc, exc_info=True)
+            logger.warning(
+                "[TG_ANSWER_CALLBACK_ERROR] data=%s chat_id=%s message_id=%s error=%s elapsed_ms=%s",
+                data,
+                chat_id,
+                message_id,
+                exc,
+                int((time.perf_counter() - ack_started) * 1000),
+                exc_info=True,
+            )
 
         logger.info("[NWE_CALLBACK_BEFORE_PROCESS] data=%s chat_id=%s message_id=%s", data, chat_id, message_id)
         result = await self._run_nwe_callback(
