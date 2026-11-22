@@ -4328,6 +4328,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         for prefix, handler in (
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
+            ("ra:", self._handle_reminder_ack_callback),
+            ("na2:", self._handle_nico_audit_callback),
             ("update_prompt:", self._handle_update_prompt_callback)):
             if data.startswith(prefix):
                 await handler(query, data, cb)
@@ -4439,6 +4441,81 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 await self._send_message_with_thread_fallback(**send_kwargs)
         except Exception as exc:
             logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
+
+    async def _handle_reminder_ack_callback(self, query, data: str, cb: dict[str, Any]) -> None:
+        """``ra:<reminder_id>`` — confirms a reminder was read and removes its keyboard."""
+        reminder_id = data.split(":", 1)[1] if ":" in data else ""
+        if not reminder_id or not await self._callback_authorized(query, cb, _unauthorized()):
+            return
+        import importlib.util
+        from hermes_constants import get_hermes_home
+        # ponytail: loaded by file path (not import) so this standalone reminder script
+        # never collides with another module named "common"; upgrade if reminders become a package.
+        # Each reminder family keeps its own state file (common.py vs helena/helena_common.py);
+        # route on the reminder_id's namespace prefix instead of always hitting the generic one (#helena-ack-miss).
+        if reminder_id.startswith("helena-"):
+            common_path = get_hermes_home() / "scripts" / "reminders" / "helena" / "helena_common.py"
+            module_name = "reminder_ack_common_helena"
+        else:
+            common_path = get_hermes_home() / "scripts" / "reminders" / "common.py"
+            module_name = "reminder_ack_common"
+        spec = importlib.util.spec_from_file_location(module_name, common_path)
+        reminder_common = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reminder_common)
+        user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
+        try:
+            result = reminder_common.acknowledge(
+                reminder_id, user_id=str(getattr(query.from_user, "id", "")), user_name=user_display)
+        except Exception as exc:
+            logger.error("[%s] reminder ack callback failed: %s", self.name, exc, exc_info=True)
+            return await answer_callback(query, "Erro ao confirmar lembrete")
+        await answer_callback(query, "Leitura confirmada ✅" if result.get("ok") else "Erro ao confirmar lembrete")
+        if result.get("ok"):
+            await edit_keeping_prompt(self, query, f"✅ Leitura confirmada por {user_display}.")
+
+    async def _handle_nico_audit_callback(self, query, data: str, cb: dict[str, Any]) -> None:
+        """``na2:<report_id>:<action>`` — Nico vault-audit fix_safe/details/dismiss buttons."""
+        parts = data.split(":", 2)
+        if len(parts) != 3 or not await self._callback_authorized(query, cb, _unauthorized()):
+            return
+        report_id, action = parts[1], parts[2]
+        import importlib.util
+        import sys
+        from hermes_constants import get_hermes_home
+        # ponytail: loaded by file path, same convention as _handle_reminder_ack_callback
+        action_path = get_hermes_home() / "scripts" / "reminders" / "nico_audit_action.py"
+        reminders_dir = str(action_path.parent)
+        if reminders_dir not in sys.path:
+            sys.path.insert(0, reminders_dir)  # nico_audit_action.py does `from common import ...`
+        spec = importlib.util.spec_from_file_location("nico_audit_action_mod", action_path)
+        nico_audit_action = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(nico_audit_action)
+        user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
+        user_id = str(getattr(query.from_user, "id", ""))
+        data_store = nico_audit_action.load_reports()
+        report = data_store.get("reports", {}).get(report_id)
+        if not isinstance(report, dict):
+            return await answer_callback(query, "Relatório não encontrado.")
+        handlers = {
+            "details": nico_audit_action.handle_details, "fix_safe": nico_audit_action.handle_fix_safe,
+            "dismiss": nico_audit_action.handle_dismiss}
+        if action not in handlers:
+            return await answer_callback(query, "Ação inválida.")
+        try:
+            result = handlers[action](report, user_id, user_display)
+        except Exception as exc:
+            logger.error("[%s] nico-audit callback failed: %s", self.name, exc, exc_info=True)
+            return await answer_callback(query, "Erro ao processar ação")
+        nico_audit_action.save_reports(data_store)
+        await answer_callback(query, str(result.get("answer_text") or "")[:_TOAST_LIMIT] or None)
+        edit_label = result.get("edit_label")
+        if edit_label:
+            await edit_keeping_prompt(self, query, f"{edit_label} — {user_display}.")
+        followup_text = result.get("followup_text")
+        if followup_text and query.message:
+            chunks = [followup_text[i:i + 3900] for i in range(0, len(followup_text), 3900)]
+            for chunk in chunks[:self.MAX_SPLIT_MESSAGES]:
+                await self._app.bot.send_message(chat_id=query.message.chat_id, text=chunk)
 
     async def _handle_clarify_callback(self, query, data: str, cb: dict[str, Any]) -> None:
         """``cl:<clarify_id>:<idx|other>`` — resolve a clarify prompt or flip to text capture."""
